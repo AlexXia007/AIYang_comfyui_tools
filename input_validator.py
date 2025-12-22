@@ -3,6 +3,8 @@ import os
 import urllib.parse
 from PIL import Image
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from io import BytesIO
 import math
 
@@ -130,7 +132,7 @@ class InputValidatorNode:
     RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
     RETURN_NAMES = ("status_code", "status", "error_message", "image_urls", "prompt_text", "prompt_status", "image_status")
     FUNCTION = "validate"
-    CATEGORY = "AIxIA_nodes_tools"
+    CATEGORY = "AIYang007_nodes_tools"
     
     def calculate_char_count(self, text):
         """
@@ -283,7 +285,7 @@ class InputValidatorNode:
     
     def get_image_info(self, url):
         """
-        获取图片信息
+        获取图片信息（带重试与 SSL 兼容处理）
         
         Args:
             url: 图片URL
@@ -291,9 +293,41 @@ class InputValidatorNode:
         Returns:
             dict: 图片信息 {width, height, size, format, has_transparency}
         """
+        # 为部分 OSS / CDN 做兼容：增加重试、浏览器 UA，并在 SSL 异常时尝试关闭证书校验再请求一次
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+        
+        # 构建带重试的 Session
+        session = requests.Session()
+        retry_cfg = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry_cfg)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
         try:
-            response = requests.get(url, timeout=10, stream=True)
-            response.raise_for_status()
+            try:
+                response = session.get(url, timeout=10, stream=True, headers=headers)
+                response.raise_for_status()
+            except requests.exceptions.SSLError:
+                # 针对类似 “UNEXPECTED_EOF_WHILE_READING” 的 SSL 问题，尝试关闭证书校验再请求一次
+                try:
+                    requests.packages.urllib3.disable_warnings()  # type: ignore
+                except Exception:
+                    pass
+                response = session.get(
+                    url, timeout=10, stream=True, headers=headers, verify=False
+                )
+                response.raise_for_status()
             
             # 获取图片字节数
             content = response.content
@@ -753,7 +787,7 @@ class InputValidatorNode:
                         if not prompt_error_found:
                             final_status_code = "416"
                             final_status = "error"
-                            final_error_message = f"第{i+1}张图片读取失败：{info['error']}"
+                            final_error_message = f"第{i+1}张图片读取失败，请重试上传"
                         break  # 读取失败，停止检测后续图片和后续验证步骤
                 
                 # 7. 如果图片读取都成功，验证图片总大小
